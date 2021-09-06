@@ -1,0 +1,9 @@
+person
+organization
+event
+object
+place
+group
+location
+time
+entity

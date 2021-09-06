@@ -1,0 +1,151 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+import random
+from typing import List
+
+import torch
+import torch.nn as nn
+from allennlp.data import Vocabulary
+from allennlp.modules import TextFieldEmbedder
+
+from entity_typing.constant import EOS_SYMBOL, UNK_SYMBOL, MAX_VAL
+
+
+class Seq2SeqDecoderOnto(nn.Module):
+    def __init__(self,
+                 vocab: Vocabulary,
+                 label_field_embedder: TextFieldEmbedder,
+                 label_embedding_dim: int,
+                 input_size: int,
+                 decoder_hidden_size: int,
+                 encoder_hidden_dim: int,
+                 output_size: int,
+                 dropout_rate: float,
+                 teaching_forcing_rate: float,
+                 decode_max_seq_len: int = 20,
+                 label_namespace: List[str] = ['seq_label_vocab', 'seq_labels'],
+                 ):
+        super(Seq2SeqDecoderOnto, self).__init__()
+        self._vocab = vocab
+        self._label_embedding_dim = label_embedding_dim
+        self._decoder_hidden_size = decoder_hidden_size
+        self._decoder = nn.LSTM(input_size=encoder_hidden_dim + label_embedding_dim,
+                                hidden_size=self._decoder_hidden_size,
+                                num_layers=1,
+                                batch_first=True,
+                                bias=True)
+        self._mlp = nn.Sequential(
+            nn.Linear(in_features=self._decoder_hidden_size,
+                      out_features=self._decoder_hidden_size),
+            nn.ReLU(),
+            nn.Dropout(p=dropout_rate),
+            nn.Linear(in_features=self._decoder_hidden_size,
+                      out_features=output_size),
+        )
+        self._label_namespace = label_namespace
+        self._teaching_forcing_rate = teaching_forcing_rate
+        self._label_field_embedder = label_field_embedder
+        self._eos_label_id = vocab.get_token_index(EOS_SYMBOL, namespace=self._label_namespace[0])
+        self._unk_label_id = vocab.get_token_index(UNK_SYMBOL, namespace=self._label_namespace[0])
+        self._seq_label_num = output_size
+        self._decode_max_seq_len = decode_max_seq_len
+        self._dense_net = nn.Linear(in_features=label_embedding_dim,
+                                    out_features=encoder_hidden_dim)
+
+        self.ge_proj1 = nn.Linear(label_embedding_dim, label_embedding_dim)
+        self.ge_proj2 = nn.Linear(label_embedding_dim, label_embedding_dim)
+        self._dropout = nn.Dropout(dropout_rate)
+
+    def forward(self, encoded_hidden_embeddings: torch.Tensor, hidden: torch.Tensor, cell: torch.Tensor,
+                text_lengths: torch.Tensor, encoder_mask: torch.BoolTensor,
+                gold_label_ids: torch.Tensor = None, gold_label_embeddings: torch.Tensor = None,
+                seq_label_mask=None) -> torch.Tensor:
+        """
+        :shape encoded_hidden_embeddings: B, Se, He
+        :shape hidden: De, B, He
+        :shape cell: De, B, He
+        :shape text_lengths: B
+        :shape encoder_mask: B, Se
+        :shape gold_label_ids: B, Sd, 1
+        :shape gold_label_embeddings: B, Sd, Ed
+        :return:
+        """
+        """
+        B: batch_size, C: Classes  
+        He: encoder_hidden_dim, Hd: decoder_hidden_dim 
+        Ee: encoder_text_embedding_dim, Ed: decoder_label_embedding_dim 
+        De: encoder's (direction * layers), Dd: decoder's (direction * layers)
+        Se: encoder_text_sequence_len, Sd: decoder_label_sequence_len
+        N: seq_label_num
+        """
+        batch_size = encoded_hidden_embeddings.size(0)
+        encoder_hidden_dim = encoded_hidden_embeddings.size(-1)
+        # 1, B, Hd
+        h0 = hidden.permute(1, 0, 2).reshape(batch_size, -1).view(batch_size, 1, -1).permute(1, 0, 2)
+        # 1, B, Hd
+        c0 = cell.permute(1, 0, 2).reshape(batch_size, -1).view(batch_size, 1, -1).permute(1, 0, 2)
+
+        # B, 1, Ed
+        input_label_embeddings = encoded_hidden_embeddings.new_zeros((batch_size, 1, self._label_embedding_dim))
+        # B, 1, He
+        input_encoder_hidden_embeddings = encoded_hidden_embeddings.new_zeros((batch_size, 1, encoder_hidden_dim))
+        # B, 1, Ed + He
+        input_embeddings = torch.cat((input_label_embeddings, input_encoder_hidden_embeddings), dim=-1)
+        # input_embeddings = input_encoder_hidden_embeddings
+
+        # B, Sd, L
+        outputs = encoded_hidden_embeddings.new_tensor([])
+        # B, 1, C
+        logits_mask = input_label_embeddings.new_zeros((batch_size, 1, self._seq_label_num), dtype=torch.int64)
+
+        # B, N, Ed
+        all_label_embedding = self._label_field_embedder(
+            {self._label_namespace[1]: {
+                'tokens': torch.LongTensor(range(self._seq_label_num)).to('cuda').repeat(batch_size, 1)}}
+        )
+        if self.training and gold_label_ids is not None:
+            decode_max_seq_len = gold_label_ids.size(1)
+        else:
+            decode_max_seq_len = self._decode_max_seq_len
+
+        next_input_ids = []
+
+        for step in range(decode_max_seq_len):
+            # output shape: B, 1, Hd
+            # h1 shape: 1, B, Hd
+            # c1 shape: 1, B, Hd
+            output, (h1, c1) = self._decoder(input_embeddings, (h0, c0))
+
+            h0 = h1
+            c0 = c1
+            output = self._mlp(output) + logits_mask
+            # output = output.softmax(2)
+            # B, Sd, L
+            outputs = torch.cat((outputs, output), dim=1)
+
+            # B, 1
+            next_input_label_ids = output.argmax(dim=-1)
+
+            pred_label_embeddings = self._label_field_embedder(
+                {self._label_namespace[1]: {'tokens': next_input_label_ids}})
+            input_label_embeddings = pred_label_embeddings
+
+            next_input_label_ids = next_input_label_ids.squeeze(1)
+
+            # (B, 1) * L
+            next_input_ids.append(next_input_label_ids)
+
+            # B, L
+            select_idx = torch.stack(next_input_ids, dim=1)
+            logits_mask = logits_mask.squeeze(1).scatter(1, select_idx, -1e7).unsqueeze(1)
+            logits_mask[:, :, self._eos_label_id] = 0
+
+            sentence_repre = self._dropout(encoded_hidden_embeddings[:, 0, :].unsqueeze(1))   # DP2
+            # sentence_repre = encoded_hidden_embeddings[:, 0, :].unsqueeze(1)
+            input_embeddings = torch.cat((input_label_embeddings, sentence_repre), dim=-1)
+
+            # input_embeddings = encoded_hidden_embeddings[:, 0, :].unsqueeze(1)
+
+        next_input_ids = torch.stack(next_input_ids, dim=1)
+
+        return outputs, next_input_ids
