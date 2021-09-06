@@ -86,4 +86,3 @@ If you use other Glove Vector, edit the dimension of **-memory-emb-size**
 If you want to train another model, you can refer to the **./train_\*.bash** file.
 
 If you want use other attributes, you can add it to data and edit the **process_line** function in **entity_typing/data_utils.py**
-# Label-Reasoning-Network
